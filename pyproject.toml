@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "datasets>=2.14.0",
-    "huggingface-hub>=0.17.0",
     "openai>=1.0.0",
     "modal>=0.63.0",
     "tqdm>=4.65.0",
@@ -26,8 +25,8 @@ gpu = [
 # Note: torch and vllm are installed separately via run_gpt_oss.sh script
 # because they require specific CUDA index URLs
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=7.0.0",
     "ruff>=0.1.0",
 ]

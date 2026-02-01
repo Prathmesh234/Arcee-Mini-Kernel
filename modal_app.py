@@ -262,6 +262,287 @@ def benchmark_triton_kernel(
     gpu="H100",
     image=image,
     volumes={"/results": volume},
+    timeout=3600,
+)
+def benchmark_kernelbench(
+    triton_code: str,
+    pytorch_code: str,
+    n_correctness: int = 5,
+    n_trials: int = 20,
+    kernel_name: Optional[str] = None,
+    entry_point: str = "Model",
+    rtol: float = 1e-4,
+    atol: float = 1e-4,
+) -> dict:
+    """
+    Benchmark a Triton kernel against PyTorch reference for KernelBench problems.
+
+    This function handles the KernelBench/KernelBook pattern where:
+    - pytorch_code defines a nn.Module class with parameters (weights, biases)
+    - pytorch_code defines get_inputs() and get_init_inputs() functions
+    - triton_code defines triton_kernel_wrapper() that takes model inputs
+
+    Args:
+        triton_code: Complete Triton kernel source code as string.
+                     Must define a function named 'triton_kernel_wrapper'.
+        pytorch_code: PyTorch code with a nn.Module class,
+                      get_inputs(), and get_init_inputs() functions.
+        n_correctness: Number of correctness checks with random inputs.
+        n_trials: Number of timing trials for performance measurement.
+        kernel_name: Optional name for the kernel (for logging/results).
+        entry_point: Name of the nn.Module class in pytorch_code (default: "Model").
+        rtol: Relative tolerance for correctness check.
+        atol: Absolute tolerance for correctness check.
+
+    Returns:
+        Benchmark result dictionary with correctness, speedup, fast_0/1/2 flags.
+    """
+    import torch
+    import time
+    import traceback
+    import tempfile
+    import importlib.util
+    import os
+    import sys
+    import inspect
+
+    # Initialize result dict
+    result = {
+        "kernel_name": kernel_name or "unnamed_kernel",
+        "timestamp": datetime.now().isoformat(),
+        "correctness": False,
+        "speedup": 0.0,
+        "reference_time_ms": None,
+        "kernel_time_ms": None,
+        "fast_0": False,
+        "fast_1": False,
+        "fast_2": False,
+        "error": None,
+    }
+
+    try:
+        # Write pytorch code to a temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='_pytorch.py', delete=False) as f:
+            f.write(pytorch_code)
+            pytorch_file = f.name
+
+        # Write triton code to a temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='_triton.py', delete=False) as f:
+            f.write(triton_code)
+            triton_file = f.name
+
+        try:
+            # Import pytorch module
+            spec = importlib.util.spec_from_file_location("pytorch_module", pytorch_file)
+            pytorch_module = importlib.util.module_from_spec(spec)
+            sys.modules["pytorch_module"] = pytorch_module
+            spec.loader.exec_module(pytorch_module)
+
+            # Get required functions and classes
+            # First try the specified entry_point, then fall back to finding any nn.Module
+            if hasattr(pytorch_module, entry_point):
+                ModelClass = getattr(pytorch_module, entry_point)
+            elif hasattr(pytorch_module, "Model"):
+                ModelClass = pytorch_module.Model
+            else:
+                # Find any class that inherits from nn.Module
+                import torch.nn as nn
+                ModelClass = None
+                for name, obj in vars(pytorch_module).items():
+                    if isinstance(obj, type) and issubclass(obj, nn.Module) and obj is not nn.Module:
+                        ModelClass = obj
+                        print(f"Found nn.Module class: {name}")
+                        break
+                if ModelClass is None:
+                    raise ValueError(f"PyTorch code must define '{entry_point}' class or an nn.Module subclass")
+
+            if not hasattr(pytorch_module, "get_inputs"):
+                raise ValueError("PyTorch code must define 'get_inputs' function")
+
+            get_inputs = pytorch_module.get_inputs
+            get_init_inputs = getattr(pytorch_module, "get_init_inputs", lambda: [])
+
+            # Import triton module
+            spec = importlib.util.spec_from_file_location("triton_module", triton_file)
+            triton_module = importlib.util.module_from_spec(spec)
+            sys.modules["triton_module"] = triton_module
+            spec.loader.exec_module(triton_module)
+
+            if not hasattr(triton_module, "triton_kernel_wrapper"):
+                raise ValueError("Triton code must define 'triton_kernel_wrapper' function")
+            triton_kernel_wrapper = triton_module.triton_kernel_wrapper
+
+            # Analyze triton_kernel_wrapper signature to understand what inputs it expects
+            sig = inspect.signature(triton_kernel_wrapper)
+            wrapper_params = list(sig.parameters.keys())
+            print(f"triton_kernel_wrapper expects: {wrapper_params}")
+
+            # Create model instance
+            init_inputs = get_init_inputs()
+            if isinstance(init_inputs, (list, tuple)) and len(init_inputs) == 2:
+                # Check if it's [args, kwargs] format
+                if isinstance(init_inputs[0], (list, tuple)) and isinstance(init_inputs[1], dict):
+                    model = ModelClass(*init_inputs[0], **init_inputs[1]).cuda()
+                else:
+                    model = ModelClass(*init_inputs).cuda()
+            elif isinstance(init_inputs, (list, tuple)):
+                model = ModelClass(*init_inputs).cuda()
+            else:
+                model = ModelClass().cuda()
+
+            model.eval()
+
+            # Check correctness
+            print(f"Running {n_correctness} correctness checks...")
+            correctness = True
+
+            for i in range(n_correctness):
+                # Generate inputs using get_inputs()
+                inputs = get_inputs()
+                if not isinstance(inputs, (list, tuple)):
+                    inputs = [inputs]
+
+                # Move inputs to CUDA
+                cuda_inputs = [x.cuda() if hasattr(x, 'cuda') else x for x in inputs]
+
+                # Run reference (PyTorch model)
+                with torch.no_grad():
+                    ref_output = model(*cuda_inputs)
+
+                # Prepare inputs for triton kernel
+                # The triton kernel may expect different arguments depending on implementation
+                # Common pattern: kernel expects (x, weight, bias) or just (x)
+                try:
+                    # Try calling with just the input tensors first
+                    if len(wrapper_params) == 1:
+                        kernel_output = triton_kernel_wrapper(cuda_inputs[0])
+                    elif len(wrapper_params) == len(cuda_inputs):
+                        kernel_output = triton_kernel_wrapper(*cuda_inputs)
+                    else:
+                        # Kernel might expect model parameters too
+                        # Try to extract them from the model
+                        kernel_args = list(cuda_inputs)
+
+                        # Look for common parameter patterns
+                        for name, param in model.named_parameters():
+                            kernel_args.append(param.data)
+
+                        # Try calling with all args
+                        kernel_output = triton_kernel_wrapper(*kernel_args[:len(wrapper_params)])
+
+                except Exception as e:
+                    # If that fails, try with explicit parameter extraction
+                    print(f"First attempt failed: {e}")
+                    # For nn.Linear based models, extract weight and bias
+                    kernel_args = list(cuda_inputs)
+                    for module in model.modules():
+                        if hasattr(module, 'weight') and module.weight is not None:
+                            kernel_args.append(module.weight.data)
+                        if hasattr(module, 'bias') and module.bias is not None:
+                            kernel_args.append(module.bias.data)
+
+                    kernel_output = triton_kernel_wrapper(*kernel_args[:len(wrapper_params)])
+
+                # Compare outputs
+                if not torch.allclose(ref_output, kernel_output, rtol=rtol, atol=atol):
+                    correctness = False
+                    max_diff = (ref_output - kernel_output).abs().max().item()
+                    print(f"Correctness check {i+1} failed. Max diff: {max_diff}")
+                    print(f"  ref shape: {ref_output.shape}, kernel shape: {kernel_output.shape}")
+                    break
+
+            result["correctness"] = correctness
+            result["fast_0"] = correctness
+
+            # Measure performance only if correct
+            if correctness:
+                print(f"Running performance benchmark ({n_trials} trials)...")
+
+                # Generate fixed inputs for timing
+                inputs = get_inputs()
+                if not isinstance(inputs, (list, tuple)):
+                    inputs = [inputs]
+                cuda_inputs = [x.cuda() if hasattr(x, 'cuda') else x for x in inputs]
+
+                # Prepare kernel args once
+                if len(wrapper_params) == 1:
+                    kernel_call = lambda: triton_kernel_wrapper(cuda_inputs[0])
+                elif len(wrapper_params) == len(cuda_inputs):
+                    kernel_call = lambda: triton_kernel_wrapper(*cuda_inputs)
+                else:
+                    kernel_args = list(cuda_inputs)
+                    for module in model.modules():
+                        if hasattr(module, 'weight') and module.weight is not None:
+                            kernel_args.append(module.weight.data)
+                        if hasattr(module, 'bias') and module.bias is not None:
+                            kernel_args.append(module.bias.data)
+                    kernel_call = lambda: triton_kernel_wrapper(*kernel_args[:len(wrapper_params)])
+
+                # Warmup
+                for _ in range(10):
+                    with torch.no_grad():
+                        _ = model(*cuda_inputs)
+                    _ = kernel_call()
+                torch.cuda.synchronize()
+
+                # Time reference
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                for _ in range(n_trials):
+                    with torch.no_grad():
+                        _ = model(*cuda_inputs)
+                torch.cuda.synchronize()
+                reference_time = (time.perf_counter() - start) / n_trials * 1000
+
+                # Time triton kernel
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                for _ in range(n_trials):
+                    _ = kernel_call()
+                torch.cuda.synchronize()
+                kernel_time = (time.perf_counter() - start) / n_trials * 1000
+
+                speedup = reference_time / kernel_time if kernel_time > 0 else 0.0
+
+                result["reference_time_ms"] = reference_time
+                result["kernel_time_ms"] = kernel_time
+                result["speedup"] = speedup
+                result["fast_1"] = speedup > 1.0
+                result["fast_2"] = speedup >= 2.0
+
+                print(f"Reference time: {reference_time:.4f} ms")
+                print(f"Kernel time: {kernel_time:.4f} ms")
+                print(f"Speedup: {speedup:.2f}x")
+
+        finally:
+            # Cleanup temporary files
+            try:
+                os.unlink(pytorch_file)
+                os.unlink(triton_file)
+            except:
+                pass
+
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+        print(f"Error during benchmark: {result['error']}")
+
+    # Save result to persistent storage
+    result_id = f"benchmark_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    result_path = f"/results/{result_id}.json"
+
+    with open(result_path, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+
+    volume.commit()
+    print(f"Result saved to {result_path}")
+
+    return result
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={"/results": volume},
     timeout=7200,
 )
 def benchmark_batch(kernels: list[dict]) -> list[dict]:
@@ -316,7 +597,7 @@ DEFAULT_PARALLEL_CONTAINERS = 4
     image=image,
     volumes={"/results": volume},
     timeout=3600,
-    concurrency_limit=8,  # Allow up to 8 parallel containers
+    max_containers=8,  # Allow up to 8 parallel containers
 )
 def benchmark_single(kernel_spec: dict) -> dict:
     """
@@ -678,3 +959,7 @@ def reference_impl(x):
     print(f"fast_2 rate: {stats['fast_2_rate']:.2%}")
     print(f"Average speedup: {stats['average_speedup']:.2f}x")
     print(f"Speedup range: {stats['speedup_distribution']['min']:.2f}x - {stats['speedup_distribution']['max']:.2f}x")
+
+
+if __name__ == "__main__":
+    main()

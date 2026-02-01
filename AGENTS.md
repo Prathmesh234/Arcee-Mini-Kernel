@@ -350,7 +350,7 @@ Implement `benchmark_parallel()` function that:
 - Returns all results when complete
 
 ```python
-@app.function(gpu="H100", image=image, concurrency_limit=4)
+@app.function(gpu="H100", image=image, max_containers=4)
 def benchmark_single(kernel_spec: dict) -> dict:
     return benchmark_triton_kernel.local(**kernel_spec)
 

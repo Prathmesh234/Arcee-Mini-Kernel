@@ -20,8 +20,9 @@ from tqdm import tqdm
 
 from dataloader import KernelDataLoader
 
-# Import Modal function for remote execution
+# Import Modal app and function for remote execution
 import modal
+from modal_app import app as modal_app, benchmark_kernelbench
 
 # Configuration
 VLLM_BASE_URL = "http://localhost:8000/v1"
@@ -68,10 +69,80 @@ def triton_kernel_wrapper(input_tensors):
     ...
 </triton>
 
-IMPORTANT:
-- The wrapper function MUST be named `triton_kernel_wrapper`
-- It should take the same inputs as the PyTorch Model.forward() method
-- It should return the same output as the PyTorch implementation
+=== CRITICAL REQUIREMENTS ===
+
+1. The wrapper function MUST be named `triton_kernel_wrapper`
+2. The wrapper takes the SAME inputs as Model.forward() - just the input tensors, NOT model weights
+3. If the model has weights (nn.Linear, nn.Conv2d, etc.), the wrapper should create random weights or accept them as additional parameters
+
+=== TRITON KERNEL RULES - MUST FOLLOW ===
+
+IMPORTS - Only use these:
+```python
+import torch
+import triton
+import triton.language as tl
+```
+
+INSIDE @triton.jit KERNELS - Use ONLY triton.language (tl) operations:
+- tl.load(), tl.store() - memory access
+- tl.arange(), tl.zeros(), tl.full() - tensor creation
+- tl.sum(), tl.max(), tl.min() - reductions
+- tl.exp(), tl.log(), tl.sqrt(), tl.abs() - math ops
+- tl.maximum(), tl.minimum() - element-wise min/max
+- tl.where() - conditional selection
+- tl.program_id(), tl.num_programs() - grid info
+- Standard operators: +, -, *, /, %, <, >, ==, &, |
+
+NEVER use inside @triton.jit:
+- torch.* functions (torch.sum, torch.mean, torch.relu, etc.)
+- .pow(), .sqrt(), .exp() methods on tensors - use tl.pow(), tl.sqrt(), tl.exp() instead
+- Python classes or objects
+- nn.* modules
+
+CONSTEXPR RULES:
+- tl.arange(start, end) - both start and end MUST be constants or tl.constexpr
+- BLOCK_SIZE: tl.constexpr in kernel signature
+- Use powers of 2: 64, 128, 256, 512, 1024
+
+REDUCTION PATTERN:
+```python
+# CORRECT - accumulator matches block size
+acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+for i in range(0, N, BLOCK_SIZE):
+    x = tl.load(ptr + offsets, mask=mask)
+    acc += x
+result = tl.sum(acc)  # reduce at the end
+
+# WRONG - shape mismatch in loop
+acc = tl.zeros([1], dtype=tl.float32)
+acc += tl.sum(x)  # ERROR: shape changes!
+```
+
+WRAPPER FUNCTION PATTERN:
+```python
+def triton_kernel_wrapper(x):
+    # x is the input tensor from get_inputs()
+    output = torch.empty_like(x)  # or appropriate shape
+
+    # Grid and block configuration
+    BLOCK_SIZE = 1024
+    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']),)
+
+    # Launch kernel
+    my_kernel[grid](x, output, x.numel(), BLOCK_SIZE=BLOCK_SIZE)
+
+    return output
+```
+
+COMMON OPERATIONS:
+- ReLU: tl.maximum(x, 0.0)
+- Sigmoid: 1.0 / (1.0 + tl.exp(-x))
+- Tanh: use tl.tanh(x) if available, else (tl.exp(x) - tl.exp(-x)) / (tl.exp(x) + tl.exp(-x))
+- Softmax: exp_x = tl.exp(x - tl.max(x)); exp_x / tl.sum(exp_x)
+- Mean: tl.sum(x) / n_elements
+
+USE ASCII ONLY - no unicode characters like – or —, use - instead.
 """
 
 
@@ -106,6 +177,9 @@ class TraceOrchestrator:
         # Load existing traces if resuming
         self.traces = self._load_existing_traces()
         self.processed_keys = {self._get_sample_key(t) for t in self.traces}
+        
+        # Ensure the output file exists or is updated immediately
+        self._save_traces()
         
     def _load_existing_traces(self) -> list:
         """Load existing traces from output file if it exists."""
@@ -232,7 +306,7 @@ class TraceOrchestrator:
         
         return None
     
-    async def validate_on_modal(
+    def validate_on_modal(
         self,
         triton_code: str,
         pytorch_code: str,
@@ -240,63 +314,28 @@ class TraceOrchestrator:
     ) -> dict:
         """
         Validate the generated Triton kernel on Modal H100.
-        
+
         Args:
             triton_code: The generated Triton kernel
             pytorch_code: The original PyTorch code
             sample: The sample dict with metadata
-            
+
         Returns:
             Benchmark result dict
         """
-        # Import the Modal app and function
-        from modal_app import benchmark_triton_kernel
-        
-        # For KernelBench: the pytorch_code contains get_inputs() which we'll use
-        # For KernelBook: we need to construct input shapes from the code
-        
-        # Create reference code that includes get_inputs() for dynamic input generation
-        # The reference uses Model.forward() as the reference implementation
-        reference_code = f'''
-{pytorch_code}
-
-# Adapter for benchmark - use the Model class from the code
-_model = Model(*get_init_inputs()) if 'get_init_inputs' in dir() else Model()
-
-def reference_impl(*inputs):
-    return _model(*inputs)
-
-# Generate inputs for benchmarking
-def generate_inputs():
-    return get_inputs()
-'''
-        
-        # For the triton kernel, we need to wrap it to accept the same inputs
-        triton_code_with_inputs = f'''
-{triton_code}
-
-# Import the get_inputs from reference for input generation
-'''
-        
-        # Since we have get_inputs() in the code, we don't need static input_shapes
-        # The Modal container will execute get_inputs() to generate test tensors
-        # 
-        # BUT our current modal_app.py expects input_shapes dict...
-        # We need to either:
-        # 1. Parse input shapes from get_inputs() 
-        # 2. Or create a new benchmark function that uses get_inputs()
-        #
-        # For now, let's try to extract a reasonable shape from the code
-        input_shapes = self._extract_input_shapes_from_code(pytorch_code)
-        
         try:
-            result = benchmark_triton_kernel.remote(
-                kernel_code=triton_code,
-                reference_torch_code=reference_code,
-                input_shapes=input_shapes,
+            # Use the new benchmark_kernelbench function that properly handles
+            # the KernelBench/KernelBook pattern with get_inputs() and get_init_inputs()
+            # KernelBook samples have an entry_point field specifying the class name
+            entry_point = sample.get("entry_point", "Model")
+
+            result = benchmark_kernelbench.remote(
+                triton_code=triton_code,
+                pytorch_code=pytorch_code,
                 n_correctness=5,
                 n_trials=20,
                 kernel_name=sample.get("name", "generated_kernel"),
+                entry_point=entry_point,
                 rtol=1e-4,
                 atol=1e-4,
             )
@@ -307,58 +346,7 @@ def generate_inputs():
                 "speedup": 0.0,
                 "error": str(e),
             }
-    
-    def _extract_input_shapes_from_code(self, pytorch_code: str) -> dict:
-        """
-        Extract input shapes from get_inputs() function in PyTorch code.
-        
-        This is a best-effort extraction - for complex cases, we default to
-        reasonable shapes.
-        """
-        import re
-        
-        # Try to find shape definitions in the code
-        input_shapes = {}
-        
-        # Look for batch_size = N pattern
-        batch_match = re.search(r'batch_size\s*=\s*(\d+)', pytorch_code)
-        batch_size = int(batch_match.group(1)) if batch_match else 32
-        
-        # Look for input_shape = (N, M, ...) pattern
-        shape_match = re.search(r'input_shape\s*=\s*\(([^)]+)\)', pytorch_code)
-        if shape_match:
-            dims = [int(d.strip()) for d in shape_match.group(1).split(',') if d.strip().isdigit()]
-            if dims:
-                input_shapes["x"] = {"shape": [batch_size] + dims, "dtype": "float32"}
-                return input_shapes
-        
-        # Look for N = number patterns (common for matrix sizes)
-        n_match = re.search(r'\bN\s*=\s*(\d+)', pytorch_code)
-        n_size = int(n_match.group(1)) if n_match else 1024
-        
-        # Look for M = number
-        m_match = re.search(r'\bM\s*=\s*(\d+)', pytorch_code)
-        m_size = int(m_match.group(1)) if m_match else n_size
-        
-        # Look for torch.rand(N, M) or similar patterns
-        rand_match = re.search(r'torch\.rand[n]?\(([^)]+)\)', pytorch_code)
-        if rand_match:
-            args = rand_match.group(1)
-            # Try to parse the arguments
-            if 'N' in args:
-                input_shapes["x"] = {"shape": [n_size, m_size], "dtype": "float32"}
-            else:
-                # Try to parse numeric dimensions
-                dims = re.findall(r'\d+', args)
-                if dims:
-                    input_shapes["x"] = {"shape": [int(d) for d in dims[:4]], "dtype": "float32"}
-        
-        # Default fallback
-        if not input_shapes:
-            input_shapes["x"] = {"shape": [batch_size, 1024], "dtype": "float32"}
-        
-        return input_shapes
-    
+
     async def process_sample(
         self,
         sample: dict,
@@ -383,6 +371,7 @@ def generate_inputs():
         pytorch_code = sample["pytorch_code"]
         
         # Step 1: Generate completion
+        print(f"Generating completion for {sample_key}...")
         completion = await self.generate_completion(pytorch_code, session)
         if not completion:
             return None
@@ -393,10 +382,16 @@ def generate_inputs():
         
         if not triton_code:
             print(f"Failed to extract Triton code for {sample_key}")
-            return None
+            return {
+                "sample_key": sample_key,
+                "error": "Triton extraction failed",
+                "full_completion": completion
+            }
         
         # Step 3: Validate on Modal
-        result = await self.validate_on_modal(triton_code, pytorch_code, sample)
+        print(f"Validating {sample_key} on Modal H100...")
+        result = self.validate_on_modal(triton_code, pytorch_code, sample)
+        print(f"Validation complete for {sample_key}: Correct={result.get('correctness')}, Speedup={result.get('speedup')}x")
         
         # Create trace
         trace = {
@@ -429,52 +424,60 @@ def generate_inputs():
     ):
         """
         Run the orchestrator.
-        
+
         Args:
             batch_size: Number of concurrent requests
             save_interval: Save traces every N samples
         """
         samples = self.dataloader.load_all()
-        
+
         print(f"Total samples: {len(samples)}")
         print(f"Already processed: {len(self.processed_keys)}")
         print(f"Remaining: {len(samples) - len(self.processed_keys)}")
         print()
-        
-        async with aiohttp.ClientSession() as session:
-            # Process in batches
-            processed = 0
-            
-            for i in tqdm(range(0, len(samples), batch_size), desc="Processing"):
-                batch = samples[i:i + batch_size]
-                
-                # Process batch concurrently
-                tasks = [
-                    self.process_sample(sample, session)
-                    for sample in batch
-                ]
-                results = await asyncio.gather(*tasks)
-                
-                # Add successful traces
-                for trace in results:
-                    if trace and trace["result"]["correctness"]:
-                        self.traces.append(trace)
-                        self.processed_keys.add(trace["sample_key"])
-                        processed += 1
-                
-                # Save periodically
-                if processed % save_interval == 0 and processed > 0:
+
+        # Run within Modal app context so .remote() calls work
+        with modal_app.run():
+            async with aiohttp.ClientSession() as session:
+                # Process in batches
+                processed = 0
+
+                for i in tqdm(range(0, len(samples), batch_size), desc="Processing"):
+                    batch = samples[i:i + batch_size]
+
+                    # Process batch concurrently
+                    tasks = [
+                        self.process_sample(sample, session)
+                        for sample in batch
+                    ]
+                    results = await asyncio.gather(*tasks)
+
+                    # Add all traces to the list so user can see progress
+                    for trace in results:
+                        if trace:
+                            self.traces.append(trace)
+                            self.processed_keys.add(trace["sample_key"])
+                            processed += 1
+
+                            if trace.get("result", {}).get("correctness"):
+                                print(f"  {trace['sample_key']} is CORRECT ({trace['result']['speedup']:.2f}x)")
+                            else:
+                                err = trace.get("result", {}).get("error") or trace.get("error", "Unknown error")
+                                print(f"  {trace['sample_key']} FAILED: {err}")
+
+                    # Save after every batch for better visibility during development
                     self._save_traces()
-                    print(f"\nSaved {len(self.traces)} traces (processed {processed})")
-        
+                    if processed > 0:
+                        print(f"Saved {len(self.traces)} traces to {self.output_file}")
+
         # Final save
         self._save_traces()
-        
+
         # Print summary
-        correct_count = sum(1 for t in self.traces if t["result"]["correctness"])
-        fast_1_count = sum(1 for t in self.traces if t["result"]["fast_1"])
-        fast_2_count = sum(1 for t in self.traces if t["result"]["fast_2"])
-        
+        correct_count = sum(1 for t in self.traces if t.get("result", {}).get("correctness"))
+        fast_1_count = sum(1 for t in self.traces if t.get("result", {}).get("fast_1"))
+        fast_2_count = sum(1 for t in self.traces if t.get("result", {}).get("fast_2"))
+
         print("\n" + "=" * 60)
         print("TRACE GENERATION COMPLETE")
         print("=" * 60)
