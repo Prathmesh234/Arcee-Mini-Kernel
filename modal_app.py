@@ -397,17 +397,50 @@ def benchmark_kernelbench(
             correctness = True
 
             for i in range(n_correctness):
-                # Generate inputs using get_inputs()
-                inputs = get_inputs()
-                if not isinstance(inputs, (list, tuple)):
-                    inputs = [inputs]
+                try:
+                    # Generate inputs using get_inputs()
+                    inputs = get_inputs()
+                    if not isinstance(inputs, (list, tuple)):
+                        inputs = [inputs]
 
-                # Move inputs to CUDA
-                cuda_inputs = [x.cuda() if hasattr(x, 'cuda') else x for x in inputs]
+                    # Move inputs to CUDA with error handling
+                    try:
+                        cuda_inputs = [x.cuda() if hasattr(x, 'cuda') else x for x in inputs]
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                        if "illegal memory access" in str(e).lower() or "cuda error" in str(e).lower():
+                            print(f"CUDA error detected during input transfer: {e}")
+                            print("Attempting to reset GPU state...")
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            # Try to reset the device
+                            try:
+                                torch.cuda.reset_peak_memory_stats()
+                            except:
+                                pass
+                            raise  # Re-raise to mark as failed
+                        raise
 
-                # Run reference (PyTorch model)
-                with torch.no_grad():
-                    ref_output = model(*cuda_inputs)
+                    # Run reference (PyTorch model)
+                    with torch.no_grad():
+                        ref_output = model(*cuda_inputs)
+
+                except (torch.cuda.OutOfMemoryError, RuntimeError, Exception) as e:
+                    error_str = str(e).lower()
+                    if "illegal memory access" in error_str or "cuda error" in error_str:
+                        print(f"CUDA error in correctness check {i+1}: {e}")
+                        print("GPU state corrupted - marking kernel as incorrect")
+                        result["error"] = f"CUDA illegal memory access during correctness check: {str(e)}"
+                        correctness = False
+                        # Reset GPU state for next kernel
+                        try:
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        except:
+                            pass
+                        break
+                    else:
+                        # Some other error - re-raise
+                        raise
 
                 # Prepare inputs for triton kernel
                 # The triton kernel may expect different arguments depending on implementation
