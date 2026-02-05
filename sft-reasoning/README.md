@@ -201,6 +201,94 @@ After SFT training:
 2. **RL Refinement**: Use the SFT checkpoint as the base for GRPO/PPO training
 3. **Merge Weights**: Optionally merge LoRA weights into base model for faster inference
 
+## Inference Server Deployment
+
+The `trinity_inference.py` script deploys a FastAPI server on Modal with OpenAI-compatible endpoints.
+
+### Setup
+
+1. **Copy environment file**:
+   ```bash
+   cp .env.example .env
+   # Edit .env with your configuration
+   ```
+
+2. **Deploy the server**:
+   ```bash
+   modal deploy trinity_inference.py
+   ```
+
+3. **Test the deployment**:
+   ```bash
+   # Health check
+   curl https://<your-modal-url>/health
+
+   # Run test function
+   modal run trinity_inference.py::test
+   ```
+
+### Endpoints
+
+After deployment, you'll have three endpoints:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/generate` | POST | Simple PyTorch → Triton conversion |
+| `/v1/chat/completions` | POST | OpenAI-compatible chat API |
+| `/health` | GET | Health check |
+
+### Usage Examples
+
+**Simple Generation:**
+```bash
+curl -X POST https://<your-modal-url>/v1/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "pytorch_code": "def relu(x): return torch.maximum(x, torch.zeros_like(x))",
+    "temperature": 0.7
+  }'
+```
+
+**OpenAI-Compatible Chat:**
+```bash
+curl -X POST https://<your-modal-url>/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "trinity-triton-sft",
+    "messages": [{"role": "user", "content": "Convert this PyTorch code to Triton: def softmax(x): ..."}],
+    "temperature": 0.7,
+    "max_tokens": 2048
+  }'
+```
+
+**Modal CLI Client:**
+```bash
+# Default example (softmax)
+modal run trinity_inference.py::client
+
+# Custom code
+modal run trinity_inference.py::client --prompt "def gelu(x): return x * 0.5 * (1 + torch.tanh(...))"
+
+# With deployed URL
+modal run trinity_inference.py::client --url "https://<your-modal-url>"
+```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MODAL_VOLUME_NAME` | Modal volume name with checkpoints | `arcee-vol` |
+| `VOLUME_MOUNT` | Mount path inside container | `/vol` |
+| `CHECKPOINT_PATH` | Path to LoRA checkpoint | `/vol/models/trinity-triton-sft/checkpoint-40` |
+| `BASE_MODEL` | Base model name | `arcee-ai/Trinity-Mini` |
+| `MODEL_NAME` | Model name in API responses | `trinity-triton-sft` |
+
+### Technical Notes
+
+- **Why PEFT instead of vLLM?** vLLM doesn't support LoRA on MoE expert layers (`gate_proj`, `up_proj`, `down_proj`). The `merge_and_unload()` approach corrupts MoE weights. PEFT inference is the only working solution.
+- **GPU**: Uses A100-80GB for the 26B MoE model with 4-bit quantization
+- **Auto-scaling**: `min_containers=0` with 5-minute scaledown window
+
 ## References
 
 - [AGENTS.md](../AGENTS.md) - Full project documentation
