@@ -1,0 +1,10 @@
+[project]
+name = "inference"
+version = "0.1.0"
+description = "Download and serve the merged Trinity-Mini model with vLLM"
+requires-python = ">=3.10, <3.13"
+dependencies = [
+    "modal",
+    "vllm",
+    "transformers<4.55",
+]

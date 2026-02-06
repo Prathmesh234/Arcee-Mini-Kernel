@@ -123,11 +123,9 @@ def benchmark_triton_kernel(...):
 
 | Function | Purpose |
 |----------|---------|
-| `benchmark_triton_kernel()` | Main benchmark function - runs single kernel |
-| `benchmark_batch()` | Sequential batch execution on same container |
-| `get_all_results()` | Retrieve all stored benchmark results |
-| `get_summary_statistics()` | Aggregate stats across all benchmarks |
-| `clear_results()` | Delete all stored results |
+| `benchmark_triton_kernel()` | Single kernel benchmark (generic `input_shapes` dict) |
+| `benchmark_kernelbench()` | Single kernel benchmark (KernelBench `nn.Module` pattern) |
+| `benchmark_batch()` | Sequential batch execution on same container with CUDA recovery |
 
 ### Why Temp Files for Kernel Code?
 
@@ -325,46 +323,39 @@ SIZE_CURRICULUM = [
 - **Realistic benchmark**: Production-sized tensors
 - **Curriculum learning**: Gradually increase difficulty
 
-### Batching Options
-
-**Sequential (current)**: One container, kernels run one after another
-```python
-results = benchmark_batch.remote(kernels=[...])
-```
-
-**Parallel (TODO)**: Multiple containers, kernels run simultaneously
-```python
-results = benchmark_parallel.remote(kernels=[...], n_gpus=4)
-```
-
 ---
 
-## Next TODO
+## Deferred Features (Future Implementation)
 
-### 1. Parallel Execution with 4 H100 Containers
+### 1. Parallel Execution with Multiple H100 Containers
 
-Implement `benchmark_parallel()` function that:
-- Accepts a list of kernels
-- Spins up N H100 containers in parallel (default: 4)
-- Distributes kernels across containers
-- Returns all results when complete
+Implement `benchmark_parallel()` using Modal's `.map()` to distribute kernels across N containers.
 
 ```python
-@app.function(gpu="H100", image=image, max_containers=4)
+@app.function(gpu="H100", image=image, max_containers=8)
 def benchmark_single(kernel_spec: dict) -> dict:
     return benchmark_triton_kernel.local(**kernel_spec)
 
-def benchmark_parallel(kernels: list[dict], n_gpus: int = 4) -> list[dict]:
-    # Use Modal's .map() for parallel execution
+def benchmark_parallel(kernels: list[dict], n_containers: int = 4) -> list[dict]:
     return list(benchmark_single.map(kernels))
 ```
 
 Benefits:
-- 4x throughput for large batches
+- 4x+ throughput for large batches
 - Total time = max(kernel_times) instead of sum(kernel_times)
 - Essential for fast RL iteration
 
-### 2. Future Enhancements
+### 2. Results Management Functions
+
+These were previously implemented but removed to keep `modal_app.py` focused on single execution. Re-add when needed:
+
+| Function | Purpose |
+|----------|---------|
+| `get_all_results()` | Retrieve all stored benchmark results from persistent volume |
+| `get_summary_statistics()` | Aggregate stats (correctness rate, speedup distribution, fast_1/fast_2 rates) |
+| `clear_results()` | Delete all stored results from persistent volume |
+
+### 3. Other Enhancements
 - [ ] Keep containers warm to reduce cold start latency
 - [ ] Add kernel caching to skip re-benchmarking identical code
 - [ ] Implement timeout tuning for faster failure detection
@@ -503,3 +494,153 @@ This ensures:
 - ✅ No solution leakage during RL
 - ✅ Clean train/test split (L1+L2 vs L3+L4)
 - ✅ Increasing difficulty for curriculum
+
+---
+
+## utilities.py - Input Extraction
+
+The `utilities.py` module provides helpers for extracting inputs from PyTorch code.
+
+### Purpose
+
+When the LLM generates a Triton kernel, it needs to know the input shapes to optimize the kernel (e.g., choosing BLOCK_SIZE). The `get_inputs()` function in PyTorch code defines these shapes.
+
+### Functions
+
+#### `extract_inputs(pytorch_code: str) -> list`
+
+Executes `get_inputs()` from the PyTorch code and returns the actual tensor list.
+
+```python
+from utilities import extract_inputs
+
+pytorch_code = '''
+import torch
+
+class MyModule(torch.nn.Module):
+    def forward(self, x):
+        return torch.relu(x)
+
+def get_inputs():
+    return [torch.rand([1024, 1024])]
+'''
+
+inputs = extract_inputs(pytorch_code)
+# inputs = [tensor of shape (1024, 1024)]
+```
+
+#### `get_shapes(pytorch_code: str) -> list[tuple]`
+
+Returns just the shapes (useful for LLM prompts).
+
+```python
+from utilities import get_shapes
+
+shapes = get_shapes(pytorch_code)
+# shapes = [(1024, 1024)]
+```
+
+### Integration with modal_app.py
+
+In `benchmark_kernelbench()`, we use utilities to extract inputs at the start:
+
+```python
+from utilities import extract_inputs
+
+# Extract inputs once to validate and log shapes
+test_inputs = extract_inputs(pytorch_code)
+print(f"Extracted {len(test_inputs)} inputs with shapes: {[tuple(t.shape) for t in test_inputs]}")
+```
+
+### Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  PyTorch Code                                                        │
+│  ┌─────────────────────────────────────┐                            │
+│  │ def get_inputs():                   │                            │
+│  │     return [torch.rand([1024])]     │                            │
+│  └─────────────────────────────────────┘                            │
+└─────────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  utilities.extract_inputs(pytorch_code)                             │
+│    1. Write code to temp file                                       │
+│    2. Import as module                                              │
+│    3. Call get_inputs()                                             │
+│    4. Return tensor list                                            │
+└─────────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Modal Container                                                     │
+│    - Uses extracted shapes for logging                              │
+│    - Calls get_inputs() for each correctness check                  │
+│    - Runs triton_kernel_wrapper(*inputs)                            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## exploration/benchmark_example.py
+
+A minimal example demonstrating the full flow:
+
+```python
+# PyTorch code (what we want to optimize)
+PYTORCH_CODE = '''
+import torch
+import torch.nn as nn
+
+class SimpleReLU(nn.Module):
+    def forward(self, x):
+        return torch.relu(x)
+
+def get_inputs():
+    return [torch.randn(1024, 1024, device='cuda')]
+
+def get_init_inputs():
+    return [[], {}]
+'''
+
+# Triton code (what LLM generates)
+TRITON_CODE = '''
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def relu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    x = tl.load(x_ptr + offsets, mask=mask)
+    output = tl.maximum(x, 0.0)
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+
+def triton_kernel_wrapper(x):
+    output = torch.empty_like(x)
+    n_elements = x.numel()
+    
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    relu_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    return output
+'''
+
+# Run benchmark
+result = benchmark_kernelbench.remote(
+    triton_code=TRITON_CODE,
+    pytorch_code=PYTORCH_CODE,
+    kernel_name="SimpleReLU",
+)
+```
+
+Run with:
+```bash
+modal run exploration/benchmark_example.py::run_examples
+```

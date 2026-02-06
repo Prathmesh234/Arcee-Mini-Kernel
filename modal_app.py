@@ -4,12 +4,25 @@ KernelBench Triton - Modal Application for Benchmarking Triton Kernels on H100 G
 This is a BENCHMARKING ONLY environment, not for reward/training.
 It accepts Triton kernel code as input, compares against PyTorch reference,
 and measures correctness + performance.
+
+Functions:
+    benchmark_triton_kernel  - Single kernel benchmark (generic input_shapes dict)
+    benchmark_kernelbench    - Single kernel benchmark (KernelBench nn.Module pattern)
+    benchmark_batch          - Sequential batch on same container with CUDA recovery
+
+For parallel execution and results management, see AGENTS.md "Deferred Features".
 """
 
 import modal
 import json
 from datetime import datetime
 from typing import Optional
+
+# Import utilities (will be available locally, imported inside functions for Modal)
+try:
+    from utilities import extract_inputs, get_shapes
+except ImportError:
+    pass
 
 # Create Modal app
 app = modal.App("kernelbench-triton")
@@ -18,6 +31,9 @@ app = modal.App("kernelbench-triton")
 volume = modal.Volume.from_name("triton-benchmark-results", create_if_missing=True)
 
 # Define container image with all dependencies
+# NOTE: KernelBook was generated with PyTorch 2.5.0, so we need that version
+#       for torch._inductor.runtime.triton_heuristics.grid to be available
+# IMPORTANT: Install KernelBench first, then upgrade PyTorch to 2.5+ after
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .env({
@@ -27,8 +43,6 @@ image = (
     })
     .apt_install("git", "build-essential")
     .pip_install(
-        "torch>=2.1.0",
-        "triton>=2.1.0",
         "numpy>=1.24.0",
         "pandas>=2.0.0",
         "datasets>=2.14.0",
@@ -37,7 +51,39 @@ image = (
         "git clone https://github.com/ScalingIntelligence/KernelBench.git /KernelBench",
         "cd /KernelBench && pip install -e .",
     )
+    # Install PyTorch 2.5+ AFTER KernelBench to ensure correct version
+    .pip_install(
+        "torch==2.5.0",  # Exact version KernelBook was generated with
+        "triton==3.1.0",  # Match triton version with PyTorch 2.5
+    )
 )
+
+
+def _check_cuda_health():
+    """Check if CUDA context is still healthy by running a small operation."""
+    import torch
+    try:
+        t = torch.zeros(1, device='cuda')
+        t = t + 1
+        del t
+        torch.cuda.synchronize()
+        return True
+    except Exception:
+        return False
+
+
+def _attempt_cuda_recovery():
+    """Attempt to recover CUDA state after an error. Returns True if successful."""
+    import torch
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    return _check_cuda_health()
 
 
 @app.function(
@@ -244,6 +290,12 @@ def benchmark_triton_kernel(
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
         print(f"Error during benchmark: {result['error']}")
+        # Attempt CUDA cleanup so batch callers have a chance to recover
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except Exception:
+            pass
 
     # Save result to persistent storage
     result_id = f"benchmark_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
@@ -356,9 +408,14 @@ def benchmark_kernelbench(
                 if ModelClass is None:
                     raise ValueError(f"PyTorch code must define '{entry_point}' class or an nn.Module subclass")
 
-            if not hasattr(pytorch_module, "get_inputs"):
-                raise ValueError("PyTorch code must define 'get_inputs' function")
-
+            # Use utilities to extract get_inputs function
+            from utilities import extract_inputs
+            
+            # Test that get_inputs works by extracting once
+            test_inputs = extract_inputs(pytorch_code)
+            print(f"Extracted {len(test_inputs)} inputs with shapes: {[tuple(t.shape) for t in test_inputs if hasattr(t, 'shape')]}")
+            
+            # Keep reference to get_inputs for repeated calls
             get_inputs = pytorch_module.get_inputs
             get_init_inputs = getattr(pytorch_module, "get_init_inputs", lambda: [])
 
@@ -446,35 +503,55 @@ def benchmark_kernelbench(
                 # The triton kernel may expect different arguments depending on implementation
                 # Common pattern: kernel expects (x, weight, bias) or just (x)
                 try:
-                    # Try calling with just the input tensors first
-                    if len(wrapper_params) == 1:
-                        kernel_output = triton_kernel_wrapper(cuda_inputs[0])
-                    elif len(wrapper_params) == len(cuda_inputs):
-                        kernel_output = triton_kernel_wrapper(*cuda_inputs)
-                    else:
-                        # Kernel might expect model parameters too
-                        # Try to extract them from the model
+                    try:
+                        # Try calling with just the input tensors first
+                        if len(wrapper_params) == 1:
+                            kernel_output = triton_kernel_wrapper(cuda_inputs[0])
+                        elif len(wrapper_params) == len(cuda_inputs):
+                            kernel_output = triton_kernel_wrapper(*cuda_inputs)
+                        else:
+                            # Kernel might expect model parameters too
+                            # Try to extract them from the model
+                            kernel_args = list(cuda_inputs)
+
+                            # Look for common parameter patterns
+                            for name, param in model.named_parameters():
+                                kernel_args.append(param.data)
+
+                            # Try calling with all args
+                            kernel_output = triton_kernel_wrapper(*kernel_args[:len(wrapper_params)])
+
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        # Don't retry on CUDA errors — GPU state is corrupted
+                        if "illegal memory access" in error_str or "cuda error" in error_str:
+                            raise
+                        # If that fails, try with explicit parameter extraction
+                        print(f"First attempt failed: {e}")
+                        # For nn.Linear based models, extract weight and bias
                         kernel_args = list(cuda_inputs)
+                        for module in model.modules():
+                            if hasattr(module, 'weight') and module.weight is not None:
+                                kernel_args.append(module.weight.data)
+                            if hasattr(module, 'bias') and module.bias is not None:
+                                kernel_args.append(module.bias.data)
 
-                        # Look for common parameter patterns
-                        for name, param in model.named_parameters():
-                            kernel_args.append(param.data)
-
-                        # Try calling with all args
                         kernel_output = triton_kernel_wrapper(*kernel_args[:len(wrapper_params)])
 
                 except Exception as e:
-                    # If that fails, try with explicit parameter extraction
-                    print(f"First attempt failed: {e}")
-                    # For nn.Linear based models, extract weight and bias
-                    kernel_args = list(cuda_inputs)
-                    for module in model.modules():
-                        if hasattr(module, 'weight') and module.weight is not None:
-                            kernel_args.append(module.weight.data)
-                        if hasattr(module, 'bias') and module.bias is not None:
-                            kernel_args.append(module.bias.data)
-
-                    kernel_output = triton_kernel_wrapper(*kernel_args[:len(wrapper_params)])
+                    error_str = str(e).lower()
+                    if "illegal memory access" in error_str or "cuda error" in error_str:
+                        print(f"CUDA error from triton kernel in check {i+1}: {e}")
+                        print("GPU state corrupted - marking kernel as incorrect")
+                        result["error"] = f"CUDA error from triton kernel: {str(e)}"
+                        correctness = False
+                        try:
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
+                        break
+                    raise
 
                 # Compare outputs
                 if not torch.allclose(ref_output, kernel_output, rtol=rtol, atol=atol):
@@ -595,10 +672,29 @@ def benchmark_batch(kernels: list[dict]) -> list[dict]:
         List of benchmark results
     """
     results = []
+    cuda_corrupted = False
+
     for i, kernel_spec in enumerate(kernels):
         print(f"\n{'='*50}")
         print(f"Benchmarking kernel {i+1}/{len(kernels)}: {kernel_spec.get('kernel_name', 'unnamed')}")
         print(f"{'='*50}")
+
+        # If CUDA was corrupted by a previous kernel, skip remaining
+        if cuda_corrupted:
+            print("Skipping: CUDA context corrupted by a previous kernel")
+            results.append({
+                "kernel_name": kernel_spec.get("kernel_name", "unnamed_kernel"),
+                "timestamp": datetime.now().isoformat(),
+                "correctness": False,
+                "speedup": 0.0,
+                "reference_time_ms": None,
+                "kernel_time_ms": None,
+                "fast_0": False,
+                "fast_1": False,
+                "fast_2": False,
+                "error": "Skipped: CUDA context corrupted by a previous kernel",
+            })
+            continue
 
         result = benchmark_triton_kernel.local(
             kernel_code=kernel_spec["kernel_code"],
@@ -610,244 +706,14 @@ def benchmark_batch(kernels: list[dict]) -> list[dict]:
         )
         results.append(result)
 
-    return results
-
-
-# =============================================================================
-# PARALLEL EXECUTION - Multiple H100 Containers
-# =============================================================================
-# This is the recommended approach for high-throughput benchmarking.
-# Uses Modal's .map() to distribute kernels across N containers.
-# Total time = max(kernel_times) instead of sum(kernel_times)
-# =============================================================================
-
-# Default number of parallel containers
-DEFAULT_PARALLEL_CONTAINERS = 4
-
-
-@app.function(
-    gpu="H100",
-    image=image,
-    volumes={"/results": volume},
-    timeout=3600,
-    max_containers=8,  # Allow up to 8 parallel containers
-)
-def benchmark_single(kernel_spec: dict) -> dict:
-    """
-    Benchmark a single Triton kernel (for parallel execution).
-    
-    This function is designed to be called via .map() for parallel execution.
-    Each call runs on a separate H100 container.
-    
-    Args:
-        kernel_spec: Kernel specification containing:
-            - kernel_code: Triton kernel source code
-            - reference_torch_code: PyTorch reference implementation
-            - input_shapes: Input tensor specifications
-            - kernel_name (optional): Name for the kernel
-            - n_correctness (optional): Number of correctness checks
-            - n_trials (optional): Number of timing trials
-            - rtol (optional): Relative tolerance for correctness
-            - atol (optional): Absolute tolerance for correctness
-    
-    Returns:
-        Benchmark result dictionary
-    """
-    return benchmark_triton_kernel.local(
-        kernel_code=kernel_spec["kernel_code"],
-        reference_torch_code=kernel_spec["reference_torch_code"],
-        input_shapes=kernel_spec["input_shapes"],
-        n_correctness=kernel_spec.get("n_correctness", 10),
-        n_trials=kernel_spec.get("n_trials", 100),
-        kernel_name=kernel_spec.get("kernel_name"),
-        rtol=kernel_spec.get("rtol", 1e-5),
-        atol=kernel_spec.get("atol", 1e-5),
-    )
-
-
-def benchmark_parallel(kernels: list[dict], n_containers: int = DEFAULT_PARALLEL_CONTAINERS) -> list[dict]:
-    """
-    Benchmark multiple Triton kernels in PARALLEL across multiple H100 containers.
-    
-    This is the recommended approach for high-throughput benchmarking.
-    Uses Modal's .map() to distribute kernels across N containers.
-    
-    Benefits:
-        - 4x+ throughput for large batches (with n_containers=4)
-        - Total time = max(kernel_times) instead of sum(kernel_times)
-        - Essential for fast RL iteration
-    
-    Args:
-        kernels: List of kernel specifications (see benchmark_single for format)
-        n_containers: Maximum number of parallel containers (default: 4)
-    
-    Returns:
-        List of benchmark results in the same order as input kernels
-    
-    Example:
-        >>> kernels = [
-        ...     {"kernel_code": code1, "reference_torch_code": ref1, ...},
-        ...     {"kernel_code": code2, "reference_torch_code": ref2, ...},
-        ... ]
-        >>> results = benchmark_parallel(kernels, n_containers=4)
-    """
-    print(f"\n{'='*60}")
-    print(f"PARALLEL BENCHMARK: {len(kernels)} kernels on up to {n_containers} H100 containers")
-    print(f"{'='*60}\n")
-    
-    # Use Modal's .map() for parallel execution
-    results = list(benchmark_single.map(kernels))
-    
-    # Print summary
-    correct = sum(1 for r in results if r.get("correctness", False))
-    fast_1 = sum(1 for r in results if r.get("fast_1", False))
-    fast_2 = sum(1 for r in results if r.get("fast_2", False))
-    
-    print(f"\n{'='*60}")
-    print(f"PARALLEL BENCHMARK COMPLETE")
-    print(f"  Total kernels: {len(results)}")
-    print(f"  Correct: {correct}/{len(results)} ({100*correct/len(results):.1f}%)")
-    print(f"  fast_1 (correct & faster): {fast_1}/{len(results)}")
-    print(f"  fast_2 (correct & 2x faster): {fast_2}/{len(results)}")
-    print(f"{'='*60}\n")
-    
-    return results
-
-
-@app.function(
-    image=image,
-    volumes={"/results": volume},
-)
-def benchmark_parallel_remote(kernels: list[dict], n_containers: int = DEFAULT_PARALLEL_CONTAINERS) -> list[dict]:
-    """
-    Remote-callable version of benchmark_parallel.
-    
-    Use this to trigger parallel benchmarking from outside Modal:
-        results = benchmark_parallel_remote.remote(kernels, n_containers=4)
-    """
-    return benchmark_parallel(kernels, n_containers)
-
-
-@app.function(
-    image=image,
-    volumes={"/results": volume},
-)
-def get_all_results() -> list[dict]:
-    """
-    Retrieve all benchmark results from persistent storage.
-
-    Returns:
-        List of all benchmark results as dictionaries.
-    """
-    import os
-
-    volume.reload()  # Refresh volume to get latest results
-
-    results = []
-    results_dir = "/results"
-
-    if os.path.exists(results_dir):
-        for filename in sorted(os.listdir(results_dir)):
-            if filename.endswith(".json"):
-                filepath = os.path.join(results_dir, filename)
-                try:
-                    with open(filepath, "r") as f:
-                        results.append(json.load(f))
-                except Exception as e:
-                    print(f"Error reading {filename}: {e}")
+        # Check if this kernel corrupted CUDA state
+        if result.get("error") and ("cuda" in result["error"].lower() or "illegal memory" in result["error"].lower()):
+            print("CUDA error detected, attempting recovery...")
+            if not _attempt_cuda_recovery():
+                print("CUDA recovery failed - remaining kernels will be skipped")
+                cuda_corrupted = True
 
     return results
-
-
-@app.function(
-    image=image,
-    volumes={"/results": volume},
-)
-def get_summary_statistics() -> dict:
-    """
-    Calculate summary statistics across all benchmarks.
-
-    Returns:
-        Dictionary containing:
-        - total_benchmarks: Total number of benchmarks
-        - correctness_rate: Fraction of correct kernels
-        - fast_1_rate: Fraction of kernels that are correct AND faster
-        - fast_2_rate: Fraction of kernels that are correct AND 2x faster
-        - average_speedup: Average speedup of correct kernels
-        - speedup_distribution: Min, median, max speedups
-    """
-    import statistics
-
-    results = get_all_results.local()
-
-    if not results:
-        return {
-            "total_benchmarks": 0,
-            "correctness_rate": 0.0,
-            "fast_1_rate": 0.0,
-            "fast_2_rate": 0.0,
-            "average_speedup": 0.0,
-            "speedup_distribution": {"min": 0.0, "median": 0.0, "max": 0.0},
-        }
-
-    total = len(results)
-    correct = sum(1 for r in results if r.get("correctness", False))
-    fast_1 = sum(1 for r in results if r.get("fast_1", False))
-    fast_2 = sum(1 for r in results if r.get("fast_2", False))
-
-    speedups = [r["speedup"] for r in results if r.get("correctness", False) and r.get("speedup")]
-    avg_speedup = statistics.mean(speedups) if speedups else 0.0
-
-    if speedups:
-        speedup_dist = {
-            "min": min(speedups),
-            "median": statistics.median(speedups),
-            "max": max(speedups),
-        }
-    else:
-        speedup_dist = {"min": 0.0, "median": 0.0, "max": 0.0}
-
-    return {
-        "total_benchmarks": total,
-        "correctness_rate": correct / total,
-        "fast_1_rate": fast_1 / total,
-        "fast_2_rate": fast_2 / total,
-        "average_speedup": avg_speedup,
-        "speedup_distribution": speedup_dist,
-    }
-
-
-@app.function(
-    image=image,
-    volumes={"/results": volume},
-)
-def clear_results() -> dict:
-    """
-    Clear all benchmark results from persistent storage.
-
-    Returns:
-        Dictionary with count of deleted files.
-    """
-    import os
-
-    volume.reload()
-
-    deleted = 0
-    results_dir = "/results"
-
-    if os.path.exists(results_dir):
-        for filename in os.listdir(results_dir):
-            if filename.endswith(".json"):
-                filepath = os.path.join(results_dir, filename)
-                try:
-                    os.remove(filepath)
-                    deleted += 1
-                except Exception as e:
-                    print(f"Error deleting {filename}: {e}")
-
-    volume.commit()
-
-    return {"deleted_files": deleted}
 
 
 @app.local_entrypoint()
@@ -979,19 +845,6 @@ def reference_impl(x):
 
     if result['error']:
         print(f"\nError: {result['error']}")
-
-    # Get summary statistics
-    print("\n" + "=" * 60)
-    print("Summary Statistics (all benchmarks):")
-    print("-" * 40)
-
-    stats = get_summary_statistics.remote()
-    print(f"Total benchmarks: {stats['total_benchmarks']}")
-    print(f"Correctness rate: {stats['correctness_rate']:.2%}")
-    print(f"fast_1 rate: {stats['fast_1_rate']:.2%}")
-    print(f"fast_2 rate: {stats['fast_2_rate']:.2%}")
-    print(f"Average speedup: {stats['average_speedup']:.2f}x")
-    print(f"Speedup range: {stats['speedup_distribution']['min']:.2f}x - {stats['speedup_distribution']['max']:.2f}x")
 
 
 if __name__ == "__main__":

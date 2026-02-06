@@ -35,3 +35,8 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.uv.workspace]
+members = [
+    "inference",
+]
