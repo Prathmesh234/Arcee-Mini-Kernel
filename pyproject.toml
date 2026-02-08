@@ -36,7 +36,12 @@ dev = [
 line-length = 100
 target-version = "py310"
 
+[tool.uv]
+# vLLM and triton are Linux/CUDA only - resolve for Linux x86_64
+required-environments = ["sys_platform == 'linux'"]
+
 [tool.uv.workspace]
 members = [
     "inference",
+    "nemotron-finetuning",
 ]
