@@ -754,3 +754,15 @@ Multi-turn traces are saved to `reasoning_traces_glm45_multiturn.json`. Each tra
 - `turns`: full history of all attempts with results and feedback
 - `full_messages`: complete conversation for SFT training
 - `final_triton_code` / `final_result`: last attempt's code and validation result
+
+---
+
+## HuggingFace Dataset
+
+**Dataset:** `ppbhatt500/kernelbook-triton-reasoning-traces`
+
+Stores verified reasoning traces (PyTorch → Triton) for SFT training. Schema uses flattened result fields (`result_correctness`, `result_speedup`, `result_fast_0/1/2`, `result_error`). The `thinking` field from local JSON files is dropped when uploading.
+
+**Appending new traces:** Use conda python (`/opt/miniconda3/bin/python3`) with `datasets` + `huggingface_hub` — the project venv has a broken `huggingface_hub`. Load existing dataset, concatenate new rows, push back with `push_to_hub()`.
+
+**Current state (2026-02-16):** 103 rows (91 original + 12 GLM-4.5 traces appended)
