@@ -24,13 +24,14 @@ from multi_turn_queue import MultiTurnQueue
 # Import Modal app and function for remote execution
 import modal
 from modal_app import app as modal_app, benchmark_kernelbench
+from utilities import pre_validate_triton_code
 
 # Configuration
 VLLM_BASE_URL = "http://localhost:8000/v1"
-MODEL_NAME = "zai-org/GLM-4.5-Air"
+MODEL_NAME = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
 OUTPUT_FILE = "reasoning_traces.json"
-OUTPUT_FILE_MULTITURN = "reasoning_traces_glm45_multiturn.json"
-MAX_MODEL_LEN = 32768  # Must match --max-model-len on vLLM server
+OUTPUT_FILE_MULTITURN = "reasoning_traces_qwen3_multiturn.json"
+MAX_MODEL_LEN = 131072  # Must match --max-model-len on vLLM server (Qwen3-235B = 131072)
 MAX_COMPLETION_TOKENS = 32768  # Upper bound; dynamically capped per request
 TEMPERATURE = 0.7
 
@@ -461,10 +462,15 @@ class TraceOrchestrator:
                 "model_reasoning": model_reasoning
             }
         
-        # Step 3: Validate on Modal
-        print(f"Validating {sample_key} on Modal H100...")
-        result = await self.validate_on_modal(triton_code, pytorch_code, sample)
-        print(f"Validation complete for {sample_key}: Correct={result.get('correctness')}, Speedup={result.get('speedup')}x")
+        # Step 3: Pre-validate locally, then validate on Modal
+        pre_error = pre_validate_triton_code(triton_code)
+        if pre_error:
+            print(f"Pre-validation failed for {sample_key}: {pre_error}")
+            result = {"correctness": False, "speedup": 0.0, "error": pre_error}
+        else:
+            print(f"Validating {sample_key} on Modal H100...")
+            result = await self.validate_on_modal(triton_code, pytorch_code, sample)
+            print(f"Validation complete for {sample_key}: Correct={result.get('correctness')}, Speedup={result.get('speedup')}x")
         
         # Create trace
         trace = {
@@ -569,10 +575,16 @@ class TraceOrchestrator:
                         if not triton_code:
                             result = {"correctness": False, "error": "Triton code extraction failed"}
                         else:
-                            print(f"Validating {item['sample_key']} turn {item['turn_num']} on Modal H100...")
-                            result = await self.validate_on_modal(
-                                triton_code, item["pytorch_code"], item["sample"]
-                            )
+                            # Quick local checks before spending a Modal call
+                            pre_error = pre_validate_triton_code(triton_code)
+                            if pre_error:
+                                print(f"  {item['sample_key']} turn {item['turn_num']} pre-validation failed: {pre_error}")
+                                result = {"correctness": False, "speedup": 0.0, "error": pre_error}
+                            else:
+                                print(f"Validating {item['sample_key']} turn {item['turn_num']} on Modal H100...")
+                                result = await self.validate_on_modal(
+                                    triton_code, item["pytorch_code"], item["sample"]
+                                )
 
                         turn_result = {
                             "turn": item["turn_num"],

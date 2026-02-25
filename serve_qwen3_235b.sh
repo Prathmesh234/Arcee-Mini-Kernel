@@ -148,7 +148,6 @@ uv run --no-sync vllm serve $MODEL_NAME \
     --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
     --max-num-seqs $MAX_NUM_SEQS \
     --swap-space $SWAP_SPACE \
-    --enable-reasoning \
     --reasoning-parser qwen3 \
     --trust-remote-code \
     --enable-prefix-caching \

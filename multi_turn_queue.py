@@ -76,11 +76,15 @@ class MultiTurnQueue:
             return "Great work! The kernel is correct and fast."
 
     def requeue_with_feedback(self, item: dict, feedback: str, completion: str):
-        """Append assistant response + feedback to messages and re-queue."""
+        """Append assistant response + feedback to messages and re-queue.
+
+        Uses appendleft so the item gets its next turn immediately (depth-first),
+        rather than waiting for all 1770+ items to cycle through (breadth-first).
+        """
         item["messages"].append({"role": "assistant", "content": completion})
         item["messages"].append({"role": "user", "content": feedback})
         item["turn_num"] += 1
-        self.queue.append(item)
+        self.queue.appendleft(item)
 
     def finalize(self, item: dict, reason: str) -> dict:
         """Build the final trace dict and add to completed list."""
