@@ -463,14 +463,24 @@ def benchmark_kernelbench(
                 Kernels vary in what they expect:
                   - just the input tensor(s) matching get_inputs()
                   - input tensor(s) + model weight/bias parameters
-                We match by parameter count.
+                We match by counting required (no-default) parameter count.
                 """
+                # Count only params without defaults — kwargs with defaults
+                # (e.g. in_features=128) should NOT be filled with weight tensors.
+                required_params = [
+                    name for name, p in sig.parameters.items()
+                    if p.default is inspect.Parameter.empty
+                ]
+                n_required = len(required_params)
+
                 if len(wrapper_params) == 1:
                     return triton_kernel_wrapper(cuda_inputs[0])
-                elif len(wrapper_params) == len(cuda_inputs):
-                    return triton_kernel_wrapper(*cuda_inputs)
+                elif n_required <= len(cuda_inputs):
+                    # All required params satisfied by cuda_inputs; pass them
+                    # and let kwargs use their defaults.
+                    return triton_kernel_wrapper(*cuda_inputs[:n_required])
                 else:
-                    # Kernel wants more args than get_inputs() provides —
+                    # Kernel wants more required args than get_inputs() provides —
                     # append model parameters (weights then biases) to fill the gap.
                     kernel_args = list(cuda_inputs)
                     for module in model.modules():
@@ -478,7 +488,7 @@ def benchmark_kernelbench(
                             kernel_args.append(module.weight.data)
                         if hasattr(module, 'bias') and module.bias is not None:
                             kernel_args.append(module.bias.data)
-                    return triton_kernel_wrapper(*kernel_args[:len(wrapper_params)])
+                    return triton_kernel_wrapper(*kernel_args[:n_required])
 
             # --- Correctness phase ---
             print(f"Running {n_correctness} correctness checks...")
@@ -503,7 +513,7 @@ def benchmark_kernelbench(
                                 kernel_args.append(module.weight.data)
                             if hasattr(module, 'bias') and module.bias is not None:
                                 kernel_args.append(module.bias.data)
-                        kernel_output = triton_kernel_wrapper(*kernel_args[:len(wrapper_params)])
+                        kernel_output = triton_kernel_wrapper(*kernel_args[:n_required])
                     except Exception:
                         raise first_err  # both attempts failed; surface the original error
 

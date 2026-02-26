@@ -78,18 +78,7 @@ SYSTEM_PROMPT = """You are an expert GPU kernel engineer. Your task is to conver
    
    The mask ensures we only touch valid memory locations.
 
-4. TRITON LANGUAGE SCOPE
-   Inside @triton.jit functions, you're in "Triton-land":
-   - Use tl.* operations ONLY
-   - No torch.* functions
-   - No Python control flow on tensor data (use tl.where instead)
-   
-   Outside (in wrapper), you're in "Python-land":
-   - Use torch.* freely
-   - Allocate tensors, compute grid sizes
-   - Launch kernels
-
-5. MATRIX OPERATIONS
+4. MATRIX OPERATIONS
    tl.dot(A, B) performs matrix multiplication:
    - Requires A.shape = (M, K) and B.shape = (K, N)
    - Results in shape (M, N)
@@ -111,7 +100,7 @@ SYSTEM_PROMPT = """You are an expert GPU kernel engineer. Your task is to conver
 For each PyTorch operation, you should:
 1. Analyze the operation and memory access patterns
 2. Think step-by-step about how to parallelize it
-3. Choose appropriate BLOCK_SIZE and num_warps
+3. Choose appropriate BLOCK_SIZE and num_warps (num_warps controls thread parallelism per block, typically 4 or 8)
 4. Write the complete Triton kernel implementation
 
 Think step-by-step about the conversion before writing code. Then provide the complete
@@ -136,17 +125,17 @@ def triton_kernel_wrapper(input_tensors):
 
 1. The wrapper function MUST be named `triton_kernel_wrapper`
 2. The wrapper takes the SAME inputs as Model.forward() - just the input tensors, NOT model weights
-3. If the model has weights (nn.Linear, nn.Conv2d, etc.), the wrapper should create random weights or accept them as additional parameters
+3. If the model has weights (nn.Linear, nn.Conv2d, etc.), accept them as additional parameters in the wrapper - the benchmark harness will pass the reference model's weights automatically
 4. **IMPORTANT**: If get_init_inputs() returns parameters (e.g., {'quantiles': 4, 'hidden_size': 128}), the wrapper MUST accept these as keyword arguments with defaults matching those values
 5. **Triton API Limitations**: tl.tanh, tl.pow, tl.unsqueeze do NOT exist - use tl.exp for tanh, ** operator for pow, reshape for unsqueeze
 
 === TRITON KERNEL RULES - MUST FOLLOW ===
 
-IMPORTS - Only use these:
+IMPORTS:
 ```python
-import torch
 import triton
 import triton.language as tl
+import torch  # wrapper only - for tensor allocation, NEVER inside @triton.jit
 ```
 
 INSIDE @triton.jit KERNELS - Use ONLY triton.language (tl) operations:
@@ -172,12 +161,14 @@ CONSTEXPR RULES:
 
 REDUCTION PATTERN:
 ```python
-# CORRECT - accumulator matches block size
+# CORRECT - accumulate in block-sized buffer, reduce once at end
 acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
 for i in range(0, N, BLOCK_SIZE):
-    x = tl.load(ptr + offsets, mask=mask)
+    offsets = i + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(ptr + offsets, mask=mask, other=0.0)
     acc += x
-result = tl.sum(acc)  # reduce at the end
+result = tl.sum(acc)
 
 # WRONG - shape mismatch in loop
 acc = tl.zeros([1], dtype=tl.float32)
@@ -187,14 +178,20 @@ acc += tl.sum(x)  # ERROR: shape changes!
 WRAPPER FUNCTION PATTERN:
 ```python
 def triton_kernel_wrapper(x):
-    # x is the input tensor from get_inputs()
-    output = torch.empty_like(x)  # or appropriate shape
+    B, C = x.shape
+    output = torch.empty((B, C), dtype=x.dtype, device=x.device)
 
-    # Grid and block configuration
+    # Dimension args to torch.empty/randn/zeros must be Python ints:
+    # CORRECT: torch.empty((B, C), ...)       -- B, C are ints from shape unpacking
+    # CORRECT: torch.randn(int(N), int(M))    -- explicit int() conversion
+    # WRONG:   torch.randn(some_tensor, ...)   -- Tensor as shape arg crashes
+
+    # Never use a multi-element Tensor in a Python if/while:
+    # WRONG:   if some_tensor:
+    # CORRECT: if some_tensor.item() > 0:
+
     BLOCK_SIZE = 1024
-    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']),)
-
-    # Launch kernel
+    grid = (triton.cdiv(x.numel(), BLOCK_SIZE),)
     my_kernel[grid](x, output, x.numel(), BLOCK_SIZE=BLOCK_SIZE)
 
     return output

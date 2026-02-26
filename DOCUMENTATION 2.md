@@ -249,3 +249,130 @@ def get_init_inputs():
 ```
 
 **Triton code** must define `triton_kernel_wrapper` that accepts the same inputs (and optionally model weights/biases — the benchmarker auto-fills these based on parameter count).
+
+## Trace Generation Pipeline
+
+The orchestrator (`orchestrator.py`) drives end-to-end trace generation: model generates Triton kernels from PyTorch code, kernels are validated on Modal H100s, and results are saved as JSON traces.
+
+### Supported Models
+
+| Model | Params (total / active) | GPUs | Run Script | Reasoning Parser |
+|-------|------------------------|------|------------|-----------------|
+| GLM-4.5-Air | 106B / 12B | 4x H100 (BF16) | `run_glm45_air.sh` | `glm45` |
+| GPT-OSS-120B | 120B | 2x H100 | `run_gpt_oss.sh` | `openai_gptoss` |
+| Qwen3-235B-A22B | 235B / 22B | 8x H100 (FP8) | `serve_qwen3_235b.sh` | `qwen3` |
+
+### Running the Pipeline
+
+**Step 1: Start a model server** (keep running in its terminal):
+
+```bash
+bash run_glm45_air.sh        # GLM-4.5-Air (4x H100)
+bash run_gpt_oss.sh           # GPT-OSS-120B (2x H100)
+bash serve_qwen3_235b.sh      # Qwen3-235B (8x H100, FP8)
+```
+
+**Step 2: Generate traces** (new terminal):
+
+```bash
+# Single-turn — one generation attempt per sample
+python orchestrator.py --output reasoning_traces.json
+
+# Multi-turn — iterative refinement with feedback (up to 4 turns)
+python orchestrator.py --multi-turn --max-turns 4 --output reasoning_traces_multiturn.json
+```
+
+### Orchestrator CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--vllm-url` | `http://localhost:8000/v1` | vLLM server URL |
+| `--output` | `reasoning_traces.json` | Output JSON file |
+| `--kernelbook-samples` | 1500 | KernelBook samples to process |
+| `--kernelbench-samples` | 1000 | KernelBench samples to process |
+| `--batch-size` | 10 | Concurrent generation requests |
+| `--save-interval` | 10 | Save every N samples (single-turn) |
+| `--multi-turn` | off | Enable multi-turn iterative refinement |
+| `--max-turns` | 4 | Max turns per sample (multi-turn only) |
+
+### Reasoning Extraction
+
+Reasoning/thinking is extracted **natively by vLLM** via the `--reasoning-parser` flag on the server. Each model has a dedicated parser (`glm45`, `qwen3`, `openai_gptoss`) that separates the model's chain-of-thought from the final output at the API level.
+
+The vLLM `/v1/chat/completions` response returns:
+
+```python
+response = await session.post(url, json=payload)
+data = await response.json()
+message = data["choices"][0]["message"]
+
+content = message["content"]                    # Final output (Triton code in <triton> tags)
+reasoning = message.get("reasoning_content")    # Chain-of-thought (extracted by vLLM parser)
+```
+
+- **`content`**: The model's final response — contains `<triton>...</triton>` code blocks
+- **`reasoning_content`**: The model's thinking/reasoning, extracted automatically by the vLLM reasoning parser
+
+No manual `<think>` tag parsing is needed. The system prompt instructs the model to think step-by-step (the model's native reasoning handles this), and to provide code inside `<triton>...</triton>` tags. The orchestrator only parses `<triton>` tags from `content`.
+
+### Multi-Turn Flow
+
+When `--multi-turn` is enabled, failed or slow kernels get feedback and retry:
+
+```
+Turn 1: Model generates kernel → benchmark on Modal → correctness=False
+        → Feedback: "Incorrect output: Output mismatch..."
+Turn 2: Model generates fixed kernel → benchmark → correctness=True, speedup=0.8x
+        → Feedback: "Correct but slow (0.80x). Optimize..."
+Turn 3: Model generates optimized kernel → benchmark → correctness=True, speedup=1.5x
+        → Stop: success_fast
+```
+
+The `MultiTurnQueue` (in `multi_turn_queue.py`) is a passive proxy that manages:
+- **Deque**: FIFO queue of items to process
+- **Turn counting**: Tracks which turn each item is on
+- **Feedback construction**: Builds appropriate feedback strings based on results
+- **Trace finalization**: Builds the final trace dict with all turns
+
+Stop conditions: `correctness=True AND speedup >= 1.0` → `success_fast`, or `turn >= max_turns` → `max_turns_reached`.
+
+See [`multi_turn.md`](./multi_turn.md) for the full architecture spec.
+
+### End-to-End Test
+
+`test_multi_turn.py` validates the full multi-turn pipeline without a live vLLM server:
+
+```bash
+python test_multi_turn.py
+```
+
+Runs 4 turns against the deployed Modal function:
+
+| Turn | Kernel | Result |
+|------|--------|--------|
+| 1 | Buggy (`x * y` instead of `relu(x + y)`) | `correctness=False` |
+| 2 | Illegal memory access (no bounds mask) | CUDA runtime error |
+| 3 | Correct but slow (two separate kernels) | `correctness=True`, `speedup < 1.0` |
+| 4 | Optimized fused add+relu (single pass) | `correctness=True`, `speedup > 1.0` |
+
+### Qwen3-235B Server Configuration
+
+The `serve_qwen3_235b.sh` script configures vLLM for Qwen3 on 8x H100 NVLink:
+
+```bash
+# Environment variables
+export VLLM_USE_V1=1                        # v1 async engine
+export SAFETENSORS_FAST_GPU=1               # Fast GPU-side deserialization
+export VLLM_WORKER_MULTIPROC_METHOD=spawn   # Required for multi-GPU
+
+# Key vLLM flags
+--tensor-parallel-size 8          # Shard across all 8 H100s
+--enable-expert-parallel          # Distribute MoE experts across TP ranks
+--max-model-len 131072            # Full 128K context window
+--gpu-memory-utilization 0.92     # Higher util since FP8 leaves headroom
+--max-num-seqs 64                 # Max concurrent sequences
+--swap-space 16                   # 16 GB CPU swap for KV cache overflow
+--reasoning-parser qwen3          # Native Qwen3 parser (extracts reasoning_content)
+--enable-reasoning                # Enable reasoning output
+--trust-remote-code               # Required for Qwen3 architecture
+```
