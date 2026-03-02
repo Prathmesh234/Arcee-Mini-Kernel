@@ -46,6 +46,9 @@ export SAFETENSORS_FAST_GPU=1
 # Required for multi-GPU: spawn workers to avoid CUDA re-init issues with fork
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
+# Disable flashinfer CUTLASS/TRTLLM MoE — FP8 block scaling needs CUDA 12.8+
+export VLLM_USE_FLASHINFER_MOE_FP8=0
+
 echo "=============================================="
 echo "Qwen3-235B-A22B Trace Generation Pipeline"
 echo "=============================================="
@@ -148,6 +151,7 @@ uv run --no-sync vllm serve $MODEL_NAME \
     --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
     --max-num-seqs $MAX_NUM_SEQS \
     --swap-space $SWAP_SPACE \
+    --enable-reasoning \
     --reasoning-parser qwen3 \
     --trust-remote-code \
     --enable-prefix-caching \

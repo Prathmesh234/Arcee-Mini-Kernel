@@ -38,6 +38,7 @@ class MultiTurnQueue:
         self.max_turns = max_turns
         self.queue: deque[dict] = deque()
         self.completed_traces: list[dict] = []
+        self.failed_tasks: list[dict] = []
 
     def add(self, item: dict):
         """Push an item onto the deque."""
@@ -87,7 +88,12 @@ class MultiTurnQueue:
         self.queue.appendleft(item)
 
     def finalize(self, item: dict, reason: str) -> dict:
-        """Build the final trace dict and add to completed list."""
+        """Build the final trace dict and add to completed list.
+
+        If all turns failed (no correctness across any turn) and the item has
+        not already been requeued once, saves the trace to failed_tasks and
+        requeues the item fresh at the end of the main queue for one more round.
+        """
         last_turn = item["turns_history"][-1]
 
         trace = {
@@ -106,5 +112,21 @@ class MultiTurnQueue:
             "timestamp": datetime.now().isoformat(),
         }
 
-        self.completed_traces.append(trace)
+        all_failed = (
+            reason == "max_turns_reached"
+            and not any(t.get("result", {}).get("correctness") for t in item["turns_history"])
+        )
+
+        if all_failed and not item.get("requeued_after_failure"):
+            self.failed_tasks.append(trace)
+            # Reset item to initial state and requeue at the end.
+            # Reassignment (not mutation) so the trace keeps its data.
+            item["messages"] = item["messages"][:2]
+            item["turn_num"] = 1
+            item["turns_history"] = []
+            item["requeued_after_failure"] = True
+            self.queue.append(item)
+        else:
+            self.completed_traces.append(trace)
+
         return trace

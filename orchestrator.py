@@ -498,6 +498,12 @@ class TraceOrchestrator:
         with open(OUTPUT_FILE_MULTITURN, "w") as f:
             json.dump(traces, f, indent=2, default=str)
 
+    def _save_failed_tasks(self, failed_tasks: list[dict]):
+        """Save failed task traces (all turns incorrect) to a separate JSON."""
+        failed_path = OUTPUT_FILE_MULTITURN.replace(".json", "_failed.json")
+        with open(failed_path, "w") as f:
+            json.dump(failed_tasks, f, indent=2, default=str)
+
     async def run_multi_turn(self, batch_size: int = 5, max_turns: int = 4):
         """
         Run multi-turn iterative refinement.
@@ -606,7 +612,9 @@ class TraceOrchestrator:
                             print(f"  {item['sample_key']} turn {item['turn_num'] - 1} -> retrying (queue size: {len(queue)})")
 
                     self._save_multiturn_traces(queue.completed_traces)
-                    print(f"Saved {len(queue.completed_traces)} traces | Queue remaining: {len(queue)}")
+                    if queue.failed_tasks:
+                        self._save_failed_tasks(queue.failed_tasks)
+                    print(f"Saved {len(queue.completed_traces)} traces | Failed/requeued: {len(queue.failed_tasks)} | Queue remaining: {len(queue)}")
 
         # Print summary
         traces = queue.completed_traces
@@ -617,7 +625,10 @@ class TraceOrchestrator:
         print(f"Total traces: {len(traces)}")
         print(f"Successful (correct + fast): {success_count}")
         print(f"Max turns reached: {len(traces) - success_count}")
+        print(f"Failed (requeued once, all turns incorrect): {len(queue.failed_tasks)}")
         print(f"Output file: {OUTPUT_FILE_MULTITURN}")
+        if queue.failed_tasks:
+            print(f"Failed tasks file: {OUTPUT_FILE_MULTITURN.replace('.json', '_failed.json')}")
 
         return traces
 
